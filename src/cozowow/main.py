@@ -30,9 +30,10 @@ def build_stored_relation_access(
     validity: Optional[Any] = None,
 ) -> str:
     """
-    Build a stored relation access atom while preserving the order of columns.
-    For each column in the select list, if a where condition exists for that column, output "col: <value>"
-    Otherwise, output the column name.
+    Build a stored relation access atom.
+
+    For each column in the select list, if a where condition exists for that column,
+    output "col: <value>"; otherwise, output the column name.
     If a validity clause is provided, append it (using '@') to the last column.
     """
     col_reprs = []
@@ -46,6 +47,58 @@ def build_stored_relation_access(
         col_reprs[-1] = f"{columns[-1]} @ {validity_str}"
     cols_str = ", ".join(col_reprs)
     return f"*{name}{{{cols_str}}}"
+
+
+def build_inline_rule(
+    head_vars: List[str],
+    atoms: List[str],
+    query_options: Optional[Dict[str, Any]] = None,
+    rule_name: str = "?",
+) -> str:
+    """
+    Build an inline CozoScript rule.
+
+    The head is constructed as:
+        rule_name[<columns>] :=
+    and the body is the conjunction of atoms joined with commas.
+
+    Query options (such as :limit, :offset, :timeout, :sleep, :order/:sort, :assert)
+    are appended as separate lines.
+    """
+    head = f"{rule_name}[{', '.join(head_vars)}] :="
+    body = ", ".join(atoms)
+    rule = head + " " + body
+    if query_options:
+        # Each option is added on its own new line
+        options_str = "\n".join(f":{k} {v}" for k, v in query_options.items())
+        rule += "\n" + options_str
+    return rule
+
+
+def build_fixed_rule(
+    head_vars: List[str],
+    utility: str,
+    input_relations: List[str],
+    options: Optional[Dict[str, Any]] = None,
+    rule_name: str = "?",
+) -> str:
+    """
+    Build a fixed CozoScript rule.
+
+    A fixed rule uses the syntax:
+        rule_name[<columns>] <~ Utility(*relation1, *relation2, ..., option1: value, ...)
+
+    The arity of the output is determined by the utility.
+    """
+    head = f"{rule_name}[{', '.join(head_vars)}] <~ "
+    # Input relations are assumed to be stored relations already formatted (with a leading asterisk)
+    inputs = ", ".join(input_relations)
+    rule = head + f"{utility}({inputs}"
+    if options:
+        opts = ", ".join(f"{k}: {format_value(v)}" for k, v in options.items())
+        rule += f", {opts}"
+    rule += ")"
+    return rule
 
 
 class CozoDB:
@@ -93,27 +146,52 @@ class CozoDB:
         offset: Optional[int] = None,
         limit: Optional[int] = None,
         validity: Optional[Any] = None,
+        extra_options: Optional[Dict[str, Any]] = None,
     ) -> pd.DataFrame:
+        """
+        Build and execute an inline CozoScript query.
+
+        This method now supports additional query options as defined in CozoScript:
+        :limit, :offset, :timeout, :sleep, :order/:sort, and :assert.
+        """
         relation_access = build_stored_relation_access(from_, select, where, validity)
         head = "?[" + ", ".join(select) + "] :="
         atoms = [relation_access]
         if conditions:
             atoms.extend(conditions)
-        rule_body = head + " " + ", ".join(atoms)
-
-        options = []
+        # Build query options dictionary from standard params and any extras.
+        options: Dict[str, Any] = {}
         if order_by:
             if isinstance(order_by, list):
-                options.append(":order " + ", ".join(order_by))
+                options["order"] = ", ".join(order_by)
             else:
-                options.append(f":order {order_by}")
+                options["order"] = order_by
         if offset is not None:
-            options.append(f":offset {offset}")
+            options["offset"] = offset
         if limit is not None:
-            options.append(f":limit {limit}")
+            options["limit"] = limit
+        if extra_options:
+            options.update(extra_options)
+        rule = build_inline_rule(head_vars=select, atoms=atoms, query_options=options)
+        return self.script(rule)
 
-        script = rule_body + ("\n" + "\n".join(options) if options else "\n")
-        return self.script(script)
+    def fixed_query(
+        self,
+        head_vars: List[str],
+        utility: str,
+        input_relations: List[str],
+        options: Optional[Dict[str, Any]] = None,
+        rule_name: str = "?",
+    ) -> pd.DataFrame:
+        """
+        Build and execute a fixed CozoScript query.
+
+        Fixed rules are used to call utilities or algorithms such as PageRank,
+        DFS, etc. The input_relations list should already include any necessary
+        formatting (e.g. an asterisk for stored relations).
+        """
+        rule = build_fixed_rule(head_vars, utility, input_relations, options, rule_name)
+        return self.script(rule)
 
     def put(
         self,
@@ -153,11 +231,12 @@ class CozoDB:
 
 if __name__ == "__main__":
     with CozoDB(engine="sqlite", db_path="mydb.db") as db:
+        # Example: simple constant rule (syntax sugar for a fixed rule)
         raw_result = db.script("?[] <- [['hello', 'world', 'Cozo!']]")
         print("Raw Query Result:")
         print(raw_result)
 
-        # Non-temporal relation.
+        # Non-temporal relation: airport.
         db.create_relation(
             "airport", keys=["code"], values=["desc", "lon", "lat", "country"]
         )
@@ -185,11 +264,12 @@ if __name__ == "__main__":
             conditions=["lon > -0.1", "lon < 0.1"],
             order_by="code",
             limit=5,
+            extra_options={"timeout": 60, "assert": "none"},
         )
         print("\nNon-Temporal Query Result:")
         print(result)
 
-        # Temporal relation.
+        # Temporal relation: hos.
         db.create_relation("hos", keys=["state", "year"], values=["hos"], temporal=True)
         hos_data = [
             {"state": "US", "year": [2001, True], "hos": "Bush"},
@@ -198,17 +278,33 @@ if __name__ == "__main__":
             {"state": "US", "year": [2021, True], "hos": "Biden"},
         ]
         db.put("hos", hos_data)
-        # According to the tutorial, a correct temporal query is:
-        # ?[hos, year] := *hos{state: "US", year, hos @ 2019}
         temporal_result = db.query(
             select=["hos", "year"], from_="hos", where={"state": "US"}, validity=2019
         )
         print("\nTemporal Query Result (2019):")
         print(temporal_result)
 
-        # Current temporal query using NOW.
         current_result = db.query(
             select=["hos", "year"], from_="hos", where={"state": "US"}, validity="NOW"
         )
         print("\nCurrent Temporal Query Result:")
         print(current_result)
+
+        # Create and populate the 'route' relation for the fixed query.
+        db.create_relation("route", keys=["src", "dst"], values=["weight"])
+        sample_routes = [
+            {"src": "A", "dst": "B", "weight": 1.0},
+            {"src": "B", "dst": "C", "weight": 2.0},
+            {"src": "C", "dst": "A", "weight": 3.0},
+        ]
+        db.put("route", sample_routes)
+
+        # Fixed query using a utility (e.g., PageRank).
+        fixed_result = db.fixed_query(
+            head_vars=[],  # Adjust head variables according to the utility's output arity.
+            utility="PageRank",
+            input_relations=["*route[]"],
+            options={"theta": 0.5},
+        )
+        print("\nFixed Query (PageRank) Result:")
+        print(fixed_result)
